@@ -90,7 +90,7 @@ async def main():
         }
         if saved_path:
             log_record["output_file"] = saved_path
-
+    
         append_run_log(
             log_record
         )
