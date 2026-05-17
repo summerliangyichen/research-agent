@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import time
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -50,6 +51,7 @@ def get_final_content(result: dict) -> str:
 
 async def main():
     while True:
+        start_time = time.time()
         query = input("enter query： ").strip()
         if query.lower() == "exit":
             break
@@ -96,6 +98,8 @@ async def main():
         print(final_content)
         if saved_path:
             print(f"\n已保存：{saved_path}")
+        end_time = time.time()
+        print('程序运行时间：%s 秒' % (end_time - start_time))
 
 if __name__ == "__main__":
     asyncio.run(main())

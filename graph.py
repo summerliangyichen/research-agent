@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from tools import crawl_webpage, fetch_related_urls
+from tools import crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage
 import json
 
 
@@ -27,6 +27,7 @@ class AgentState(TypedDict):
     query: str
     path: str
     indexed: bool
+    content: str
 
 class search(BaseModel):
     should_search: bool
@@ -45,7 +46,7 @@ llm = ChatDeepSeek(
     extra_body={"thinking": {"type": "disabled"}},
 )
 
-tools = [crawl_webpage, fetch_related_urls]
+tools = [crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage]
 llm_with_tools = llm.bind_tools(tools)
 
 async def should_search(state:AgentState) -> dict:
@@ -108,22 +109,29 @@ def route_after_assistant(state: AgentState) -> str:
 def decide_generate_research_note(state:AgentState) -> AgentState:
     return {}
 
-async def determine_filename(state: AgentState) -> dict:
-    structured_llm = llm.with_structured_output(structured_filename)
-    query = state["query"]
-    response = await structured_llm.ainvoke(
-        [
-            SystemMessage(content="根据用户输入，给出一个适合保存为 Markdown 文件名的中文标题，不要包含路径。"),
-            HumanMessage(content=query),
-        ]
-    )
-    return {"filename": response.filename}
+def determine_filename(state: AgentState) -> dict:
+    content = state["messages"][-1].content
+
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", str(block)) if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    elif not isinstance(content, str):
+        content = str(content)
+
+    content = "".join(content.splitlines(keepends=True)[2:]).strip()
+    lines = content.splitlines()
+    first_line = lines[0].removeprefix("#").strip() if lines else ""
+
+    return {"filename": first_line,
+            "content": content}
 
 def save_markdown(state:AgentState) -> dict:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = state["filename"]
-    content = state["messages"][-1].content
+    content = state["content"]
 
     if filename:
         safe_name = _safe_markdown_filename(filename)
@@ -142,7 +150,7 @@ def save_markdown(state:AgentState) -> dict:
 
 def _safe_markdown_filename(filename: str) -> str:
     name = Path(filename).name.strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
     if not name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         name = f"output_{timestamp}.md"
@@ -151,7 +159,15 @@ def _safe_markdown_filename(filename: str) -> str:
     return name
 
 async def save_json(state: AgentState) -> AgentState:
-    content = state["messages"][-1].content
+    content = state.get("content") or state["messages"][-1].content
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", str(block)) if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    elif not isinstance(content, str):
+        content = str(content)
+
     structured_llm = llm.with_structured_output(summary_note)
     response = (
         await structured_llm.ainvoke([

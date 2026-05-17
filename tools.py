@@ -70,6 +70,31 @@ def is_static_webpage(url: str, timeout: float = 10.0) -> bool:
     page = _fetch_webpage(url, timeout=timeout)
     return _looks_static(page["html"], page["headers"], page["final_url"])
 
+async def _crawl_webpage_once(
+    url: str,
+    max_chars: int = 3000,
+    max_json_chars: int = 20000,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    try:
+        page = await _fetch_webpage_async(url, timeout=timeout)
+        return _build_crawl_result(
+            page,
+            max_chars=max_chars,
+            max_json_chars=max_json_chars,
+        )
+    except httpx.HTTPStatusError as exc:
+        return _crawl_error(
+            url,
+            "HTTPStatusError",
+            str(exc),
+            status_code=exc.response.status_code,
+        )
+    except (httpx.RequestError, ValueError) as exc:
+        return _crawl_error(url, type(exc).__name__, str(exc))
+    except Exception as exc:
+        return _crawl_error(url, type(exc).__name__, str(exc))
+
 
 @tool
 async def crawl_webpage(
@@ -86,19 +111,52 @@ async def crawl_webpage(
     before crawling.
     """
 
-    try:
-        page = await _fetch_webpage_async(url, timeout=timeout)
-    except httpx.HTTPStatusError as exc:
-        return _crawl_error(
-            url,
-            "HTTPStatusError",
-            str(exc),
-            status_code=exc.response.status_code,
-        )
-    except (httpx.RequestError, ValueError) as exc:
-        return _crawl_error(url, type(exc).__name__, str(exc))
+    return await _crawl_webpage_once(
+        url,
+        max_chars=max_chars,
+        max_json_chars=max_json_chars,
+        timeout=timeout,
+    )
 
-    return _build_crawl_result(page, max_chars=max_chars, max_json_chars=max_json_chars)
+@tool
+async def batch_crawl_webpage(
+    urls: list[str],
+    max_chars: int = 3000,
+    max_json_chars: int = 20000,
+    timeout: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Fetch multiple webpages concurrently.
+
+    Each result has the same structure as crawl_webpage. The function keeps input order,
+    skips empty or duplicate URLs, and fetches all remaining URLs in one call.
+    """
+
+    cleaned_urls: list[str] = []
+    seen_urls: set[str] = set()
+
+    for url in urls:
+        if not isinstance(url, str):
+            continue
+
+        cleaned_url = url.strip()
+        if not cleaned_url or cleaned_url in seen_urls:
+            continue
+
+        cleaned_urls.append(cleaned_url)
+        seen_urls.add(cleaned_url)
+
+    return await asyncio.gather(
+        *[
+            _crawl_webpage_once(
+                url,
+                max_chars=max_chars,
+                max_json_chars=max_json_chars,
+                timeout=timeout,
+            )
+            for url in cleaned_urls
+        ]
+    )
+    
 
 
 def _build_crawl_result(
@@ -548,7 +606,7 @@ def fetch_related_urls(query: str) -> str:
                 query,
                 topic="general",
                 search_depth="basic",
-                max_results=10,
+                max_results=5,
                 timeout=20,
             )
             break
@@ -584,4 +642,4 @@ def read_file(path:str) -> str:
 
 
 
-__all__ = ["is_static_webpage", "crawl_webpage", "fetch_related_urls"]
+__all__ = ["is_static_webpage", "crawl_webpage", "batch_crawl_webpage", "fetch_related_urls"]
