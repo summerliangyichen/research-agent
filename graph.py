@@ -11,8 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
-from tools import crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage
+from langgraph.prebuilt import ToolNode
+from tool import crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage
 import json
 
 
@@ -451,6 +451,8 @@ async def save_json(state: AgentState) -> AgentState:
 
 builder = StateGraph(AgentState)
 
+builder.add_node("determine_required_path", determine_required_path)
+builder.add_node("should_search", should_search)
 builder.add_node("assistant", assistant_node)
 builder.add_node("tools", ToolNode(tools))
 builder.add_node("decide_generate_research_note", decide_generate_research_note)
@@ -458,7 +460,9 @@ builder.add_node("determine_filename", determine_filename)
 builder.add_node("save_markdown", save_markdown)
 builder.add_node("save_json", save_json)
 
-builder.add_edge(START, "assistant")
+builder.add_edge(START, "determine_required_path")
+builder.add_edge("determine_required_path", "should_search")
+builder.add_edge("should_search", "assistant")
 builder.add_conditional_edges(
     "assistant",
     route_after_assistant,

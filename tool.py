@@ -118,19 +118,12 @@ async def crawl_webpage(
         timeout=timeout,
     )
 
-@tool
-async def batch_crawl_webpage(
+async def crawl_webpages(
     urls: list[str],
     max_chars: int = 3000,
     max_json_chars: int = 20000,
     timeout: float = 10.0,
 ) -> list[dict[str, Any]]:
-    """Fetch multiple webpages concurrently.
-
-    Each result has the same structure as crawl_webpage. The function keeps input order,
-    skips empty or duplicate URLs, and fetches all remaining URLs in one call.
-    """
-
     cleaned_urls: list[str] = []
     seen_urls: set[str] = set()
 
@@ -155,6 +148,27 @@ async def batch_crawl_webpage(
             )
             for url in cleaned_urls
         ]
+    )
+
+
+@tool
+async def batch_crawl_webpage(
+    urls: list[str],
+    max_chars: int = 3000,
+    max_json_chars: int = 20000,
+    timeout: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Fetch multiple webpages concurrently.
+
+    Each result has the same structure as crawl_webpage. The function keeps input order,
+    skips empty or duplicate URLs, and fetches all remaining URLs in one call.
+    """
+
+    return await crawl_webpages(
+        urls,
+        max_chars=max_chars,
+        max_json_chars=max_json_chars,
+        timeout=timeout,
     )
     
 
@@ -591,12 +605,7 @@ def _needs_browser_rendering(html: str, text: str, json_blocks: list[dict[str, A
         and any(marker in lower_html for marker in framework_shell_markers)
     )
 
-@tool
-def fetch_related_urls(query: str) -> str:
-    """
-    This function uses the Tavily API to search web pages related to the query.
-    You should use this function only if the query does not contain enough URLs.
-    """
+def search_related_urls(query: str, max_results: int = 5) -> list[str]:
     tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY") or os.getenv("TVLY_API_KEY"))
     last_error = ""
 
@@ -606,7 +615,7 @@ def fetch_related_urls(query: str) -> str:
                 query,
                 topic="general",
                 search_depth="basic",
-                max_results=5,
+                max_results=max_results,
                 timeout=20,
             )
             break
@@ -615,14 +624,30 @@ def fetch_related_urls(query: str) -> str:
             if attempt < 3:
                 time.sleep(attempt * 2)
                 continue
-            return (
+            raise RuntimeError(
                 "SEARCH_ERROR: Tavily 搜索失败，可能是当前网络或 SSL 连接不稳定。"
                 f"已重试 {attempt} 次。错误：{last_error}"
-            )
+            ) from exc
         except Exception as exc:
-            return f"SEARCH_ERROR: Tavily 搜索失败。错误：{type(exc).__name__}: {exc}"
+            raise RuntimeError(
+                f"SEARCH_ERROR: Tavily 搜索失败。错误：{type(exc).__name__}: {exc}"
+            ) from exc
 
     urls = [result["url"] for result in response.get("results", []) if result.get("url")]
+    return urls
+
+
+@tool
+def fetch_related_urls(query: str) -> str:
+    """
+    This function uses the Tavily API to search web pages related to the query.
+    You should use this function only if the query does not contain enough URLs.
+    """
+    try:
+        urls = search_related_urls(query, max_results=5)
+    except RuntimeError as exc:
+        return str(exc)
+
     if not urls:
         return "NO_RESULTS: Tavily 没有返回可用 URL。"
 
@@ -642,4 +667,11 @@ def read_file(path:str) -> str:
 
 
 
-__all__ = ["is_static_webpage", "crawl_webpage", "batch_crawl_webpage", "fetch_related_urls"]
+__all__ = [
+    "is_static_webpage",
+    "crawl_webpage",
+    "batch_crawl_webpage",
+    "crawl_webpages",
+    "fetch_related_urls",
+    "search_related_urls",
+]
