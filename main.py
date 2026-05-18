@@ -27,6 +27,9 @@ def append_run_log(record: dict) -> None:
     with RUNS_LOG.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+def make_run_id() -> str:
+    return datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+
 def load_agent() -> str:
     if not AGENT_PATH.exists():
         AGENT_PATH.write_text("", encoding="utf-8")
@@ -58,10 +61,12 @@ async def main():
         if not query:
             continue
 
+        run_id = make_run_id()
         user_request = f"请围绕以下问题或主题进行 research，并生成 Markdown 研究笔记：{query}"
         try:
             result = await graph.ainvoke(
                 {
+                    "run_id": run_id,
                     "query": query,
                     "messages": [
                         SystemMessage(content=load_agent()),
@@ -72,8 +77,11 @@ async def main():
         except Exception as exc:
             append_run_log(
                 {
+                    "run_id": run_id,
                     "query": query,
                     "status": "error",
+                    "saved": False,
+                    "elapsed_seconds": round(time.time() - start_time, 3),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
@@ -82,12 +90,18 @@ async def main():
 
         final_content = get_final_content(result)
         saved_path = result.get("path")
+        note_id = result.get("note_id")
+        elapsed_seconds = round(time.time() - start_time, 3)
 
         log_record = {
+            "run_id": run_id,
             "query": query,
             "status": "success",
             "saved": bool(saved_path),
+            "elapsed_seconds": elapsed_seconds,
         }
+        if note_id:
+            log_record["note_id"] = note_id
         if saved_path:
             log_record["output_file"] = saved_path
     
@@ -98,8 +112,7 @@ async def main():
         print(final_content)
         if saved_path:
             print(f"\n已保存：{saved_path}")
-        end_time = time.time()
-        print('程序运行时间：%s 秒' % (end_time - start_time))
+        print('程序运行时间：%s 秒' % elapsed_seconds)
 
 if __name__ == "__main__":
     asyncio.run(main())

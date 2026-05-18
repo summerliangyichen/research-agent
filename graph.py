@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from langchain_deepseek import ChatDeepSeek
-from typing import TypedDict, Annotated
-from pydantic import BaseModel
+from typing import TypedDict, Annotated, Any, NotRequired
+from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from tools import crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage
@@ -19,15 +20,19 @@ WORK_DIR = Path(__file__).parent
 OUTPUTS_DIR = WORK_DIR / "outputs"
 INDEX_PATH = OUTPUTS_DIR / "index.jsonl"
 
-
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     should_search: bool
     filename: str
+    run_id: str
+    note_id: str
     query: str
     path: str
     indexed: bool
     content: str
+    links: list[str]
+    sources: list[dict[str, Any]]
+    required_path: NotRequired[str | None]
 
 class search(BaseModel):
     should_search: bool
@@ -41,6 +46,12 @@ class structured_filename(BaseModel):
 class summary_note(BaseModel):
     summary_format: str
 
+class parse_required_path(BaseModel):
+    required_path: str | None = Field(
+        default=None,
+        description="用户明确指定的保存路径或文件名；如果没有指定则为 None",
+    )
+
 llm = ChatDeepSeek(
     model="deepseek-v4-flash",
     extra_body={"thinking": {"type": "disabled"}},
@@ -51,7 +62,7 @@ llm_with_tools = llm.bind_tools(tools)
 
 async def should_search(state:AgentState) -> dict:
     structured_llm = llm.with_structured_output(search)
-    query = state["query"]
+    query = _sanitize_text(state["query"])
     response = await structured_llm.ainvoke(
         [
             SystemMessage(
@@ -65,16 +76,38 @@ async def should_search(state:AgentState) -> dict:
         ]
     )
     return {"should_search": response.should_search}
-    
+
+async def determine_required_path(state:AgentState) -> AgentState:
+    query = _sanitize_text(state["query"])
+    structured_llm = llm.with_structured_output(parse_required_path)
+    response = await structured_llm.ainvoke([
+        SystemMessage(
+            content=(
+                "Identify whether the user explicitly mentioned a file path or file name "
+                "for saving the generated Markdown note. Return None if no explicit save "
+                "path or file name is mentioned. Do not invent a path."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"identify the required path in this query: {query}"
+            )
+        )
+    ])
+
+    return {
+        "required_path": response.required_path
+    }
+
 async def assistant_node(state: AgentState) -> AgentState:
-    response = await llm_with_tools.ainvoke(state["messages"])
+    response = await llm_with_tools.ainvoke(_sanitize_messages(state["messages"]))
     return {"messages": [response]}
 
 async def should_save_research_note(state: AgentState) -> bool:
     if not state["messages"]:
         return False
 
-    content = state["messages"][-1].content
+    content = _content_to_text(state["messages"][-1].content)
     if not isinstance(content, str):
         return False
 
@@ -109,64 +142,284 @@ def route_after_assistant(state: AgentState) -> str:
 def decide_generate_research_note(state:AgentState) -> AgentState:
     return {}
 
-def determine_filename(state: AgentState) -> dict:
-    content = state["messages"][-1].content
+async def determine_filename(state: AgentState) -> dict:
+    content = _content_to_text(state["messages"][-1].content).strip()
+    structured_llm = llm.with_structured_output(structured_filename)
+    response = await structured_llm.ainvoke(
+        [
+            SystemMessage(
+                content=(
+                    "你负责给一篇 Research Markdown 笔记生成保存文件名。"
+                    "只返回一个适合保存为 Markdown 文件名的短标题。"
+                    "文件名必须是 1-2 个核心名词或名词短语，不要解释，不要副标题，"
+                    "不要冒号、破折号、括号补充说明、Obsidian 双链符号或 .md 后缀。"
+                    "例如用户问“全局解释器锁是什么”，返回“全局解释器锁”；"
+                    "用户问“CPython 和 Python”，返回“CPython 与 Python”。"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"用户原始问题：\n{state.get('query', '')}\n\n"
+                    f"Research Markdown 笔记：\n{content}"
+                )
+            ),
+        ]
+    )
+    filename = _normalize_filename_label(response.filename)
 
-    if isinstance(content, list):
-        content = "\n".join(
-            block.get("text", str(block)) if isinstance(block, dict) else str(block)
-            for block in content
-        )
-    elif not isinstance(content, str):
-        content = str(content)
-
-    content = "".join(content.splitlines(keepends=True)[2:]).strip()
-    lines = content.splitlines()
-    first_line = lines[0].removeprefix("#").strip() if lines else ""
-
-    return {"filename": first_line,
-            "content": content}
+    return {"filename": filename, "content": content}
 
 def save_markdown(state:AgentState) -> dict:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = state["filename"]
     content = state["content"]
+    required_path = state.get("required_path")
 
-    if filename:
+    if required_path:
+        target_path = safe_path(required_path)
+    elif filename:
         safe_name = _safe_markdown_filename(filename)
+        target_path = OUTPUTS_DIR / safe_name
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = f"output_{timestamp}.md"
+        target_path = OUTPUTS_DIR / safe_name
 
-    target_path = OUTPUTS_DIR / safe_name
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(content, encoding="utf-8")
 
-    latest_path = OUTPUTS_DIR / "latest.md"
-    latest_path.write_text(content, encoding="utf-8")
-
     return {"path": str(target_path)}
+
+def safe_path(path: str, base_dir: Path = OUTPUTS_DIR) -> Path:
+    raw_path = _content_to_text(path).strip().strip("'\"“”` ")
+    if not raw_path:
+        raise ValueError("path 不能为空")
+
+    candidate = Path(raw_path)
+    if any(part in {".", ".."} for part in candidate.parts):
+        raise ValueError("path 不能包含 . 或 ..")
+
+    filename = _safe_markdown_filename(candidate.name)
+
+    if candidate.suffix and candidate.suffix.lower() != ".md":
+        raise ValueError("只允许保存 Markdown 文件（.md）")
+
+    if candidate.is_absolute():
+        target_path = candidate.with_name(filename)
+    else:
+        target_path = base_dir / candidate.parent / filename
+
+    base = base_dir.resolve()
+    resolved = target_path.resolve()
+
+    try:
+        relative_path = resolved.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"path 必须位于 {base} 内") from exc
+
+    for part in relative_path.parts:
+        _validate_safe_path_part(part)
+
+    return resolved
 
 
 def _safe_markdown_filename(filename: str) -> str:
     name = Path(filename).name.strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = name.rstrip(" .")
     if not name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         name = f"output_{timestamp}.md"
     if not name.lower().endswith(".md"):
         name = f"{name}.md"
+    if _is_windows_reserved_name(name):
+        name = f"_{name}"
     return name
+
+def _is_windows_reserved_name(name: str) -> bool:
+    reserved_names = {
+        "CON", "PRN", "AUX", "NUL",
+        *{f"COM{i}" for i in range(1, 10)},
+        *{f"LPT{i}" for i in range(1, 10)},
+    }
+    return Path(name).stem.upper() in reserved_names
+
+def _validate_safe_path_part(part: str) -> None:
+    if part in {"", ".", ".."}:
+        raise ValueError("path 不能包含空路径段、. 或 ..")
+    if part != part.rstrip(" ."):
+        raise ValueError("path 不能包含以空格或点结尾的路径段")
+    if re.search(r'[<>:"|?*\x00-\x1f]', part):
+        raise ValueError("path 包含 Windows 非法字符")
+    if _is_windows_reserved_name(part):
+        raise ValueError("path 包含 Windows 保留名称")
+
+def _normalize_filename_label(filename: str) -> str:
+    name = _content_to_text(filename).strip()
+    name = name.removeprefix("#").strip()
+    name = _wikilinks_to_text(name)
+    name = Path(name).name.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip()
+    if name.lower().endswith(".md"):
+        name = name[:-3].strip()
+    if not name:
+        return datetime.now().strftime("output_%Y%m%d_%H%M%S")
+    return name
+
+def _sanitize_text(text: str) -> str:
+    return "".join("\uFFFD" if 0xD800 <= ord(char) <= 0xDFFF else char for char in text)
+
+def _sanitize_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_text(value)
+
+    if isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(_sanitize_value(item) for item in value)
+
+    if isinstance(value, dict):
+        return {_sanitize_value(key): _sanitize_value(item) for key, item in value.items()}
+
+    return value
+
+def _sanitize_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    sanitized_messages: list[BaseMessage] = []
+
+    for message in messages:
+        updates: dict[str, Any] = {}
+        content = getattr(message, "content", None)
+        clean_content = _sanitize_value(content)
+        if clean_content != content:
+            updates["content"] = clean_content
+
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        clean_additional_kwargs = _sanitize_value(additional_kwargs)
+        if clean_additional_kwargs != additional_kwargs:
+            updates["additional_kwargs"] = clean_additional_kwargs
+
+        sanitized_messages.append(message.model_copy(update=updates) if updates else message)
+
+    return sanitized_messages
+
+def _wikilinks_to_text(markdown: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw_link = match.group(1).strip()
+        target, separator, alias = raw_link.partition("|")
+        display_text = alias.strip() if separator else target.strip()
+        display_text = display_text.split("#", 1)[0].strip()
+        display_text = display_text.split("^", 1)[0].strip()
+        return display_text
+
+    return re.sub(r"\[\[([^\[\]\n]+?)\]\]", replace, markdown)
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return _sanitize_text(content)
+
+    if isinstance(content, list):
+        return _sanitize_text("\n".join(
+            block.get("text", str(block)) if isinstance(block, dict) else str(block)
+            for block in content
+        ))
+
+    return _sanitize_text(str(content))
+
+def _extract_wikilinks(markdown: str) -> list[str]:
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for match in re.finditer(r"(?<!!)\[\[([^\[\]\n]+?)\]\]", markdown):
+        raw_link = match.group(1).strip()
+        target = raw_link.split("|", 1)[0].strip()
+        target = target.split("#", 1)[0].strip()
+        target = target.split("^", 1)[0].strip()
+
+        if target and target not in seen:
+            links.append(target)
+            seen.add(target)
+
+    return links
+
+def _parse_tool_content(content: Any) -> Any | None:
+    if isinstance(content, dict | list):
+        return content
+
+    text = _content_to_text(content).strip()
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+def _iter_crawl_results(payload: Any):
+    if isinstance(payload, dict):
+        if "ok" in payload and "url" in payload:
+            yield payload
+            return
+
+        for value in payload.values():
+            if isinstance(value, dict | list):
+                yield from _iter_crawl_results(value)
+
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from _iter_crawl_results(item)
+
+def _extract_sources_from_messages(messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for message in messages:
+        if getattr(message, "type", "") != "tool" and message.__class__.__name__ != "ToolMessage":
+            continue
+
+        payload = _parse_tool_content(getattr(message, "content", ""))
+        if payload is None:
+            continue
+
+        for result in _iter_crawl_results(payload):
+            if result.get("ok") is not True:
+                continue
+
+            url = result.get("url")
+            if not isinstance(url, str):
+                continue
+
+            url = url.strip()
+            if not url or url in seen_urls:
+                continue
+
+            title = result.get("title")
+            site = urlparse(url).netloc
+            source: dict[str, Any] = {
+                "title": str(title).strip() if title else url,
+                "url": url,
+            }
+            if site:
+                source["site"] = site
+
+            sources.append(source)
+            seen_urls.add(url)
+
+    return sources
+
+def _make_note_id(title: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = _safe_markdown_filename(title).removesuffix(".md")
+    return f"{timestamp}_{name}"
 
 async def save_json(state: AgentState) -> AgentState:
     content = state.get("content") or state["messages"][-1].content
-    if isinstance(content, list):
-        content = "\n".join(
-            block.get("text", str(block)) if isinstance(block, dict) else str(block)
-            for block in content
-        )
-    elif not isinstance(content, str):
-        content = str(content)
+    title = state["filename"]
+    content = _content_to_text(content)
+    links = _extract_wikilinks(content)
+    sources = _extract_sources_from_messages(state["messages"])
+    note_id = _make_note_id(title)
 
     structured_llm = llm.with_structured_output(summary_note)
     response = (
@@ -179,17 +432,22 @@ async def save_json(state: AgentState) -> AgentState:
     ).summary_format
 
     record = {
-        "query":state["query"],
+        "note_id": note_id,
+        "run_id": state.get("run_id", ""),
+        "title": title,
+        "query": state["query"],
         "filename": state["filename"],
         "path": state["path"],
         "summary": response,
+        "links": links,
+        "sources": sources,
         "created_at": datetime.now().astimezone().isoformat()
     }
 
     with INDEX_PATH.open("a", encoding = "utf-8") as file:
         file.write(json.dumps(record,ensure_ascii = False)+"\n")
 
-    return {"indexed":True}
+    return {"indexed": True, "note_id": note_id, "links": links, "sources": sources}
 
 builder = StateGraph(AgentState)
 
