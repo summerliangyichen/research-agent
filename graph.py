@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from langchain_deepseek import ChatDeepSeek
-from typing import TypedDict, Annotated, Any, NotRequired
+from typing import TypedDict, Annotated, Any, NotRequired,Literal
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
@@ -22,7 +22,7 @@ INDEX_PATH = OUTPUTS_DIR / "index.jsonl"
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    should_search: bool
+    intention: Literal["research", "chat"]
     filename: str
     run_id: str
     note_id: str
@@ -35,7 +35,7 @@ class AgentState(TypedDict):
     required_path: NotRequired[str | None]
 
 class search(BaseModel):
-    should_search: bool
+    intention: Literal["research", "chat"]
 
 class save_research_note(BaseModel):
     should_save: bool
@@ -60,22 +60,36 @@ llm = ChatDeepSeek(
 tools = [crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage]
 llm_with_tools = llm.bind_tools(tools)
 
-async def should_search(state:AgentState) -> dict:
+async def identify_intention(state:AgentState) -> dict:
     structured_llm = llm.with_structured_output(search)
     query = _sanitize_text(state["query"])
     response = await structured_llm.ainvoke(
         [
             SystemMessage(
                 content=(
-                    "Decide whether the user's query needs web search. "
-                    "Return true for current, factual, research, URL, or source-backed questions. "
-                    "Return false for casual chat or tasks that do not need external information."
+                    "Classify the user's raw input into exactly one label: research or chat.\n\n"
+                    "Return research only when the user is asking for a substantive research note, "
+                    "multi-source investigation, source-backed explanation, URL/page analysis, news/background research, "
+                    "or a complex topic that should become a saved Markdown research artifact.\n\n"
+                    "Return chat for greetings, small talk, simple direct questions, date/time questions, "
+                    "short factual answers, clarification, commands about the program, or anything that should not be saved "
+                    "as a long-term research note.\n\n"
+                    "Examples:\n"
+                    "- hi -> chat\n"
+                    "- 你好 -> chat\n"
+                    "- 今天几号 -> chat\n"
+                    "- 现在几点 -> chat\n"
+                    "- time.sleep 的参数是秒吗 -> chat\n"
+                    "- Python 异步编程 -> research\n"
+                    "- 帮我研究 CPython 和 Python 的区别 -> research\n"
+                    "- 阅读这个 URL 并总结 -> research\n\n"
+                    "If unsure, choose chat. Do not classify a query as research merely because it is a question."
                 )
             ),
             HumanMessage(content=query),
         ]
     )
-    return {"should_search": response.should_search}
+    return {"intention": response.intention}
 
 async def determine_required_path(state:AgentState) -> AgentState:
     query = _sanitize_text(state["query"])
@@ -116,9 +130,17 @@ async def should_save_research_note(state: AgentState) -> bool:
         [
             SystemMessage(
                 content=(
-                    "Decide whether the assistant's final answer should be saved as a research note. "
-                    "Return true only if it is a complete research-style Markdown note worth saving, "
-                    "not a casual reply, short answer, clarification question, error message, or tool/status text."
+                    "Decide whether the assistant's final answer should be saved as a long-term Research Markdown note.\n\n"
+                    "Return true only when ALL conditions are met:\n"
+                    "1. The original user query is a substantive research request, not casual chat or a simple direct question.\n"
+                    "2. The assistant final answer is a complete Research Markdown note, not a short answer.\n"
+                    "3. The answer starts with a Markdown H1 title such as '# [[...]]'.\n"
+                    "4. The answer contains research-note sections such as 核心结论, 背景与上下文, 主要线索, 关联观察, 仍需确认, or 来源.\n"
+                    "5. The content is worth saving for future retrieval.\n\n"
+                    "Return false for greetings, small talk, date/time questions, one-sentence answers, casual replies, "
+                    "clarification questions, error messages, tool/status text, or any answer to queries like 'hi', '你好', "
+                    "'今天几号', '现在几点'.\n\n"
+                    "If unsure, return false."
                 )
             ),
             HumanMessage(
@@ -449,10 +471,13 @@ async def save_json(state: AgentState) -> AgentState:
 
     return {"indexed": True, "note_id": note_id, "links": links, "sources": sources}
 
+def route_after_intention(state: AgentState) -> str:
+    return state["intention"]
+
 builder = StateGraph(AgentState)
 
 builder.add_node("determine_required_path", determine_required_path)
-builder.add_node("should_search", should_search)
+builder.add_node("identify_intention", identify_intention)
 builder.add_node("assistant", assistant_node)
 builder.add_node("tools", ToolNode(tools))
 builder.add_node("decide_generate_research_note", decide_generate_research_note)
@@ -460,9 +485,16 @@ builder.add_node("determine_filename", determine_filename)
 builder.add_node("save_markdown", save_markdown)
 builder.add_node("save_json", save_json)
 
-builder.add_edge(START, "determine_required_path")
-builder.add_edge("determine_required_path", "should_search")
-builder.add_edge("should_search", "assistant")
+builder.add_edge(START,"identify_intention")
+builder.add_conditional_edges(
+    "identify_intention",
+    route_after_intention,
+    {
+        "research": "determine_required_path",
+        "chat": "assistant"
+    }
+)
+builder.add_edge("determine_required_path", "assistant")
 builder.add_conditional_edges(
     "assistant",
     route_after_assistant,
@@ -483,5 +515,7 @@ builder.add_conditional_edges(
 builder.add_edge("determine_filename", "save_markdown")
 builder.add_edge("save_markdown", "save_json")
 builder.add_edge("save_json", END)
+
+builder.add_edge("assistant", END)
 
 graph = builder.compile()

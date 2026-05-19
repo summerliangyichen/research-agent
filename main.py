@@ -62,7 +62,12 @@ async def main():
             continue
 
         run_id = make_run_id()
-        user_request = f"请围绕以下问题或主题进行 research，并生成 Markdown 研究笔记：{query}"
+        user_request = (
+            f"用户原始输入：{query}\n\n"
+            "请根据系统规则处理：如果这是问候、闲聊、日期时间、简单直接问题或不值得保存的短问题，"
+            "直接简短回答，不要生成 Research Markdown 笔记；如果这是需要资料整理、网页分析、"
+            "多来源研究或长期沉淀的主题，再生成完整 Research Markdown 研究笔记。"
+        )
         try:
             result = await graph.ainvoke(
                 {
