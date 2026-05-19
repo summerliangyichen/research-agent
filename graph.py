@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from langchain_deepseek import ChatDeepSeek
-from typing import TypedDict, Annotated, Any, NotRequired,Literal
+from typing import TypedDict, Annotated, Any, NotRequired, Literal
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
@@ -10,15 +10,17 @@ import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from dotenv import load_dotenv
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from tool import crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage
+from tool import crawl_webpage, fetch_related_urls, read_file, batch_crawl_webpage
 import json
 
 
 WORK_DIR = Path(__file__).parent
 OUTPUTS_DIR = WORK_DIR / "outputs"
 INDEX_PATH = OUTPUTS_DIR / "index.jsonl"
+load_dotenv(WORK_DIR / ".env")
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -33,6 +35,7 @@ class AgentState(TypedDict):
     links: list[str]
     sources: list[dict[str, Any]]
     required_path: NotRequired[str | None]
+    time_range: NotRequired[str | None]
 
 class search(BaseModel):
     intention: Literal["research", "chat"]
@@ -57,7 +60,7 @@ llm = ChatDeepSeek(
     extra_body={"thinking": {"type": "disabled"}},
 )
 
-tools = [crawl_webpage, fetch_related_urls,read_file,batch_crawl_webpage]
+tools = [crawl_webpage, fetch_related_urls, read_file, batch_crawl_webpage]
 llm_with_tools = llm.bind_tools(tools)
 
 async def identify_intention(state:AgentState) -> dict:
@@ -121,9 +124,12 @@ async def should_save_research_note(state: AgentState) -> bool:
     if not state["messages"]:
         return False
 
-    content = _content_to_text(state["messages"][-1].content)
-    if not isinstance(content, str):
+    content = _clean_research_markdown(state["messages"][-1].content)
+    if not content:
         return False
+
+    if _looks_like_research_markdown(content):
+        return True
 
     structured_llm = llm.with_structured_output(save_research_note)
     response = await structured_llm.ainvoke(
@@ -135,8 +141,9 @@ async def should_save_research_note(state: AgentState) -> bool:
                     "1. The original user query is a substantive research request, not casual chat or a simple direct question.\n"
                     "2. The assistant final answer is a complete Research Markdown note, not a short answer.\n"
                     "3. The answer starts with a Markdown H1 title such as '# [[...]]'.\n"
-                    "4. The answer contains research-note sections such as 核心结论, 背景与上下文, 主要线索, 关联观察, 仍需确认, or 来源.\n"
-                    "5. The content is worth saving for future retrieval.\n\n"
+                    "4. The answer contains a fixed 核心结论 section and enough prose analysis to be useful as a note.\n"
+                    "5. The answer does not need to follow fixed section names such as 背景与上下文, 主要线索, 关联观察, or 仍需确认.\n"
+                    "6. The content is worth saving for future retrieval.\n\n"
                     "Return false for greetings, small talk, date/time questions, one-sentence answers, casual replies, "
                     "clarification questions, error messages, tool/status text, or any answer to queries like 'hi', '你好', "
                     "'今天几号', '现在几点'.\n\n"
@@ -165,7 +172,7 @@ def decide_generate_research_note(state:AgentState) -> AgentState:
     return {}
 
 async def determine_filename(state: AgentState) -> dict:
-    content = _content_to_text(state["messages"][-1].content).strip()
+    content = _clean_research_markdown(_content_to_text(state["messages"][-1].content))
     structured_llm = llm.with_structured_output(structured_filename)
     response = await structured_llm.ainvoke(
         [
@@ -195,7 +202,7 @@ def save_markdown(state:AgentState) -> dict:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = state["filename"]
-    content = state["content"]
+    content = _clean_research_markdown(state["content"])
     required_path = state.get("required_path")
 
     if required_path:
@@ -211,7 +218,7 @@ def save_markdown(state:AgentState) -> dict:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(content, encoding="utf-8")
 
-    return {"path": str(target_path)}
+    return {"path": str(target_path), "content": content}
 
 def safe_path(path: str, base_dir: Path = OUTPUTS_DIR) -> Path:
     raw_path = _content_to_text(path).strip().strip("'\"“”` ")
@@ -348,6 +355,40 @@ def _content_to_text(content: Any) -> str:
         ))
 
     return _sanitize_text(str(content))
+
+def _clean_research_markdown(content: Any) -> str:
+    text = _content_to_text(content).strip()
+    if not text:
+        return text
+
+    heading_match = re.search(r"(?m)^#\s+", text)
+    if heading_match:
+        return text[heading_match.start():].strip()
+
+    removable_prefixes = [
+        r"^Good,\s*I have\b.*?(?:research note\.|compile the research note\.)",
+        r"^I have\b.*?(?:research note\.|compile the research note\.)",
+        r"^Let me\b.*?(?:research note\.|compile the research note\.)",
+        r"^信息足够丰富了[，,].*?研究笔记。",
+        r"^我来(?:整合)?生成(?:研究笔记)?。",
+        r"^以下是(?:整理好的)?研究笔记[:：]?",
+        r"^研究笔记(?:已经)?生成(?:如下)?[:：]?",
+        r"^这个问题.*?我来生成。",
+    ]
+    for pattern in removable_prefixes:
+        text = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    return text
+
+def _looks_like_research_markdown(content: str) -> bool:
+    text = _clean_research_markdown(content)
+    if not re.search(r"(?m)^#\s+\S+", text):
+        return False
+    if "## 核心结论" not in text:
+        return False
+    if len(text) < 500:
+        return False
+    return True
 
 def _extract_wikilinks(markdown: str) -> list[str]:
     links: list[str] = []

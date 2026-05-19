@@ -14,3 +14,4 @@ wheels/
 .python-version
 graph_flow.mmd
 outputs
+.outlook_token_cache.json

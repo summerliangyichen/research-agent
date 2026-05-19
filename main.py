@@ -4,7 +4,7 @@ import time
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
-from graph import graph
+from graph import graph, _clean_research_markdown
 from datetime import datetime
 from pathlib import Path
 import json
@@ -16,7 +16,7 @@ AGENT_PATH = WORK_PATH / "AGENTS.md"
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-load_dotenv()
+load_dotenv(override= True)
 
 
 def append_run_log(record: dict) -> None:
@@ -38,18 +38,21 @@ def load_agent() -> str:
 
 
 def get_final_content(result: dict) -> str:
+    if result.get("content"):
+        return _clean_research_markdown(result["content"])
+
     content = result["messages"][-1].content
 
     if isinstance(content, str):
-        return content
+        return _clean_research_markdown(content)
 
     if isinstance(content, list):
-        return "\n".join(
+        return _clean_research_markdown("\n".join(
             block.get("text", str(block)) if isinstance(block, dict) else str(block)
             for block in content
-        )
+        ))
 
-    return str(content)
+    return _clean_research_markdown(str(content))
 
 
 async def main():

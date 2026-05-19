@@ -7,7 +7,7 @@ import asyncio
 import time
 from html import unescape
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -605,18 +605,26 @@ def _needs_browser_rendering(html: str, text: str, json_blocks: list[dict[str, A
         and any(marker in lower_html for marker in framework_shell_markers)
     )
 
-def search_related_urls(query: str, max_results: int = 5) -> list[str]:
+def search_related_urls(
+    query: str,
+    days: int | None = None,
+    topic: Literal["general", "news", "finance"] = "general",
+    max_results: int = 5,
+    search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic",
+) -> list[str]:
     tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY") or os.getenv("TVLY_API_KEY"))
     last_error = ""
+    max_results = max(1, min(max_results, 20))
 
     for attempt in range(1, 4):
         try:
             response = tavily_client.search(
                 query,
-                topic="general",
-                search_depth="basic",
+                topic=topic,
+                search_depth=search_depth,
                 max_results=max_results,
                 timeout=20,
+                days=days,
             )
             break
         except RequestException as exc:
@@ -638,13 +646,32 @@ def search_related_urls(query: str, max_results: int = 5) -> list[str]:
 
 
 @tool
-def fetch_related_urls(query: str) -> str:
+def fetch_related_urls(
+    query: str,
+    days: int | None = None,
+    topic: Literal["general", "news", "finance"] = "general",
+    max_results: int = 5,
+    search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic",
+) -> str:
     """
     This function uses the Tavily API to search web pages related to the query.
     You should use this function only if the query does not contain enough URLs.
+
+    Args:
+        query: Search query.
+        days: Restrict results to recent N days. Use None when the query is not time-sensitive.
+        topic: Tavily topic. Use general for most research, news for current events, finance for finance topics.
+        max_results: Number of URLs to return, between 1 and 20.
+        search_depth: Search depth. Use basic by default; advanced for complex research.
     """
     try:
-        urls = search_related_urls(query, max_results=5)
+        urls = search_related_urls(
+            query=query,
+            days=days,
+            topic=topic,
+            max_results=max_results,
+            search_depth=search_depth,
+        )
     except RuntimeError as exc:
         return str(exc)
 
