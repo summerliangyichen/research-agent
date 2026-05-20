@@ -37,6 +37,9 @@ DAILY_EMAIL_QUERY=今日新闻
 DAILY_EMAIL_HOUR=8
 DAILY_EMAIL_MINUTE=0
 DAILY_EMAIL_CHECK_INTERVAL_SECONDS=30
+DAILY_EMAIL_RETRY_COUNT=2
+DAILY_EMAIL_RETRY_DELAY_SECONDS=10
+DAILY_EMAIL_TIMEOUT_SECONDS=300
 ```
 
 说明：
@@ -47,6 +50,9 @@ DAILY_EMAIL_CHECK_INTERVAL_SECONDS=30
 - `MS_TENANT_ID`：个人 Outlook 账号通常用 `consumers`。
 - `MAIL_WHITELIST`：允许收发邮件的白名单邮箱，多个邮箱用英文逗号分隔。
 - `DAILY_EMAIL_TO`：每日简报发送到哪个邮箱，必须在白名单内。
+- `DAILY_EMAIL_RETRY_COUNT`：每日任务失败后额外重试几次，默认 `2`。
+- `DAILY_EMAIL_RETRY_DELAY_SECONDS`：两次重试之间等待几秒，默认 `10`。
+- `DAILY_EMAIL_TIMEOUT_SECONDS`：单次每日任务最多运行几秒，默认 `300`。
 
 ### 3. 验证代码能导入
 
@@ -106,6 +112,8 @@ python daily_email.py
 5. 发送纯文本 Outlook 邮件到 `DAILY_EMAIL_TO`
 6. 写入运行日志
 
+如果 Tavily、LLM、爬虫或 Outlook 临时失败，`daily_email.py` 会按 `.env` 中的重试配置自动重试。每一次尝试都会写入 `outputs/runs.jsonl`。
+
 ### 7. 启动常驻定时任务
 
 ```powershell
@@ -157,4 +165,3 @@ TAVILY_API_KEY=your_tavily_api_key
 ### 邮箱不在白名单内
 
 确保 `DAILY_EMAIL_TO` 中的邮箱也出现在 `MAIL_WHITELIST` 中。
-

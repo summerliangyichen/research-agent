@@ -22,6 +22,19 @@ load_dotenv(WORK_DIR / ".env")
 DEFAULT_QUERY = "今日新闻"
 
 
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
+    if value < min_value or value > max_value:
+        raise ValueError(f"{name} 必须在 {min_value}-{max_value} 之间")
+    return value
+
+
 def make_daily_run_id() -> str:
     return datetime.now().strftime("daily_%Y%m%d_%H%M%S")
 
@@ -39,6 +52,18 @@ def get_daily_recipient() -> str:
     if not recipient:
         raise RuntimeError("缺少环境变量 DAILY_EMAIL_TO")
     return recipient
+
+
+def get_daily_retry_count() -> int:
+    return _env_int("DAILY_EMAIL_RETRY_COUNT", 2, 0, 10)
+
+
+def get_daily_retry_delay_seconds() -> int:
+    return _env_int("DAILY_EMAIL_RETRY_DELAY_SECONDS", 10, 0, 3600)
+
+
+def get_daily_timeout_seconds() -> int:
+    return _env_int("DAILY_EMAIL_TIMEOUT_SECONDS", 300, 30, 3600)
 
 
 def fetch_today_news_urls(query: str, max_results: int = 5) -> list[str]:
@@ -91,10 +116,68 @@ def _replace_wikilink(match: re.Match[str]) -> str:
 
 
 async def daily_email() -> dict:
-    start_time = time.time()
-    run_id = make_daily_run_id()
     query = get_daily_query()
     recipient = get_daily_recipient()
+    retry_count = get_daily_retry_count()
+    retry_delay = get_daily_retry_delay_seconds()
+    timeout = get_daily_timeout_seconds()
+    max_attempts = retry_count + 1
+    base_run_id = make_daily_run_id()
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        run_id = f"{base_run_id}_attempt_{attempt}"
+        start_time = time.time()
+
+        try:
+            return await asyncio.wait_for(
+                _daily_email_once(
+                    run_id=run_id,
+                    query=query,
+                    recipient=recipient,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                ),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            last_exc = exc
+            append_run_log(
+                {
+                    "run_id": run_id,
+                    "query": query,
+                    "status": "error",
+                    "saved": False,
+                    "emailed": False,
+                    "recipient": recipient,
+                    "elapsed_seconds": round(time.time() - start_time, 3),
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "will_retry": attempt < max_attempts,
+                    "error_type": type(exc).__name__,
+                    "error": f"daily_email 超过 {timeout} 秒未完成",
+                }
+            )
+        except Exception as exc:
+            last_exc = exc
+
+        if attempt < max_attempts:
+            await asyncio.sleep(retry_delay)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("daily_email 未完成，且没有可用错误信息")
+
+
+async def _daily_email_once(
+    *,
+    run_id: str,
+    query: str,
+    recipient: str,
+    attempt: int,
+    max_attempts: int,
+) -> dict:
+    start_time = time.time()
     title = today_title()
 
     try:
@@ -135,6 +218,8 @@ async def daily_email() -> dict:
             "emailed": True,
             "recipient": recipient,
             "elapsed_seconds": round(time.time() - start_time, 3),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
             "searched_days": 1,
             "search_topic": "news",
             "source_urls": urls,
@@ -158,6 +243,9 @@ async def daily_email() -> dict:
             "emailed": False,
             "recipient": recipient,
             "elapsed_seconds": round(time.time() - start_time, 3),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "will_retry": attempt < max_attempts,
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
