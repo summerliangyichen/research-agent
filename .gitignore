@@ -17,4 +17,4 @@ outputs
 logs
 .outlook_token_cache.json
 models/
-tests
+tests/
