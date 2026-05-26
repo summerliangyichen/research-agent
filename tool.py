@@ -5,18 +5,32 @@ import os
 import re
 import asyncio
 import time
+from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import httpx
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_deepseek import ChatDeepSeek
+from pydantic import BaseModel, Field
 from requests.exceptions import RequestException
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from rag import (
+    DEFAULT_RAG_MIN_SCORE,
+    embedding_provider,
+    ensure_embeddings,
+    load_chunks,
+    load_index_records,
+    make_context,
+    retrieve,
+)
 
 load_dotenv()
 
@@ -27,6 +41,45 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0 Safari/537.36"
 )
+WORK_DIR = os.path.dirname(os.path.abspath(__file__))
+WORK_DIR_PATH = Path(WORK_DIR)
+OUTPUTS_DIR = WORK_DIR_PATH / "outputs"
+BASH_TOOL_MAX_TIMEOUT_SECONDS = 30
+BASH_TOOL_MAX_OUTPUT_CHARS = 6000
+INDEX_PATH = OUTPUTS_DIR / "index.jsonl"
+LOCAL_NOTE_SELECTOR_CATALOG_LIMIT = 40
+LOCAL_NOTE_SELECTOR_SUMMARY_CHARS = 280
+BASH_TOOL_BLOCKED_PATTERNS = (
+    r"(^|[\s;|&])Remove-Item([\s;|&]|$)",
+    r"(^|[\s;|&])rm([\s;|&]|$)",
+    r"(^|[\s;|&])del([\s;|&]|$)",
+    r"(^|[\s;|&])erase([\s;|&]|$)",
+    r"(^|[\s;|&])rmdir([\s;|&]|$)",
+    r"(^|[\s;|&])rd([\s;|&]|$)",
+    r"(^|[\s;|&])Move-Item([\s;|&]|$)",
+    r"(^|[\s;|&])mv([\s;|&]|$)",
+    r"\bFormat-Volume\b",
+    r"\bdiskpart\b",
+    r"\bshutdown\b",
+    r"\brestart-computer\b",
+    r"\bgit\s+reset\b",
+    r"\bgit\s+checkout\s+--\b",
+)
+catalog_selector_llm = ChatDeepSeek(
+    model="deepseek-v4-flash",
+    extra_body={"thinking": {"type": "disabled"}},
+)
+
+
+class LocalNoteSelection(BaseModel):
+    candidate_ids: list[int] = Field(
+        default_factory=list,
+        description="最相关的候选文章 catalog_id 列表，按相关性排序",
+    )
+    reasoning: str = Field(
+        default="",
+        description="一句话说明为什么选择这些候选文章",
+    )
 
 
 class _ReadableTextParser(HTMLParser):
@@ -684,14 +737,611 @@ def fetch_related_urls(
 
 @tool
 def read_file(path:str) -> str:
-    """This tool reads the file with the path path"""
+    """Read a UTF-8 text file from disk."""
     try:
-        with open(path,"r", encoding = "UTF-8") as file:
+        with open(path, "r", encoding="UTF-8") as file:
             return file.read()
-    except Exception as e:
-        return f"error reading file {str(e)}"
+    except Exception as exc:
+        return f"error reading file {str(exc)}"
 
 
+def _coerce_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", str(block)) if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    return str(content)
+
+
+def _clean_markdown_content(content: Any) -> str:
+    text = _coerce_text(content).strip()
+    if not text:
+        return text
+
+    heading_match = re.search(r"(?m)^#\s+", text)
+    if heading_match:
+        return text[heading_match.start():].strip()
+    return text
+
+
+def _wikilinks_to_text(markdown: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw_link = match.group(1).strip()
+        target, separator, alias = raw_link.partition("|")
+        display_text = alias.strip() if separator else target.strip()
+        display_text = display_text.split("#", 1)[0].strip()
+        display_text = display_text.split("^", 1)[0].strip()
+        return display_text
+
+    return re.sub(r"\[\[([^\[\]\n]+?)\]\]", replace, markdown)
+
+
+def _is_windows_reserved_name(name: str) -> bool:
+    reserved_names = {
+        "CON", "PRN", "AUX", "NUL",
+        *{f"COM{i}" for i in range(1, 10)},
+        *{f"LPT{i}" for i in range(1, 10)},
+    }
+    return Path(name).stem.upper() in reserved_names
+
+
+def _safe_markdown_filename(filename: str) -> str:
+    name = Path(filename).name.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = name.rstrip(" .")
+    if not name:
+        name = datetime.now().strftime("output_%Y%m%d_%H%M%S")
+    if not name.lower().endswith(".md"):
+        name = f"{name}.md"
+    if _is_windows_reserved_name(name):
+        name = f"_{name}"
+    return name
+
+
+def _normalize_filename_label(filename: str) -> str:
+    name = _coerce_text(filename).strip()
+    name = name.removeprefix("#").strip()
+    name = _wikilinks_to_text(name)
+    name = Path(name).name.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip()
+    if name.lower().endswith(".md"):
+        name = name[:-3].strip()
+    if not name:
+        return datetime.now().strftime("output_%Y%m%d_%H%M%S")
+    return name
+
+
+def _validate_safe_path_part(part: str) -> None:
+    if part in {"", ".", ".."}:
+        raise ValueError("path 不能包含空路径段、. 或 ..")
+    if part != part.rstrip(" ."):
+        raise ValueError("path 不能包含以空格或点结尾的路径段")
+    if re.search(r'[<>:"|?*\x00-\x1f]', part):
+        raise ValueError("path 包含 Windows 非法字符")
+    if _is_windows_reserved_name(part):
+        raise ValueError("path 包含 Windows 保留名称")
+
+
+def _safe_output_path(path: str | None, title: str) -> Path:
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if path:
+        raw_path = _coerce_text(path).strip().strip("'\"“”` ")
+        if not raw_path:
+            raise ValueError("path 不能为空")
+
+        candidate = Path(raw_path)
+        if not candidate.is_absolute() and candidate.parts:
+            leading = candidate.parts[0].lower()
+            if leading in {OUTPUTS_DIR.name.lower(), "outputs"}:
+                remaining_parts = candidate.parts[1:]
+                candidate = Path(*remaining_parts) if remaining_parts else Path(candidate.name)
+        if any(part in {".", ".."} for part in candidate.parts):
+            raise ValueError("path 不能包含 . 或 ..")
+
+        filename = _safe_markdown_filename(candidate.name)
+        if candidate.suffix and candidate.suffix.lower() != ".md":
+            raise ValueError("只允许保存 Markdown 文件（.md）")
+
+        target_path = candidate.with_name(filename) if candidate.is_absolute() else OUTPUTS_DIR / candidate.parent / filename
+        resolved = target_path.resolve()
+        base = OUTPUTS_DIR.resolve()
+        try:
+            relative_path = resolved.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(f"path 必须位于 {base} 内") from exc
+
+        for part in relative_path.parts:
+            _validate_safe_path_part(part)
+        return resolved
+
+    safe_name = _safe_markdown_filename(title)
+    return (OUTPUTS_DIR / safe_name).resolve()
+
+
+def _extract_markdown_title(content: str) -> str:
+    match = re.search(r"(?m)^#\s+(.+?)\s*$", content)
+    if not match:
+        return ""
+    return _normalize_filename_label(match.group(1))
+
+
+def _extract_wikilinks(markdown: str) -> list[str]:
+    links: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"(?<!!)\[\[([^\[\]\n]+?)\]\]", markdown):
+        raw_link = match.group(1).strip()
+        target = raw_link.split("|", 1)[0].strip()
+        target = target.split("#", 1)[0].strip()
+        target = target.split("^", 1)[0].strip()
+        if target and target not in seen:
+            links.append(target)
+            seen.add(target)
+    return links
+
+
+def _extract_sources_from_markdown(markdown: str) -> list[dict[str, Any]]:
+    match = re.search(r"(?ms)^##\s+来源\s*\n(?P<body>.+)$", markdown)
+    body = match.group("body") if match else markdown
+    sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        url_match = re.search(r"https?://\S+", line)
+        if not url_match:
+            continue
+        url = url_match.group(0).rstrip(").,")
+        if url in seen_urls:
+            continue
+
+        label = line.removeprefix("-").strip()
+        label = label.replace(url_match.group(0), "").strip(" ：:-")
+        site = urlparse(url).netloc
+        sources.append(
+            {
+                "title": label or url,
+                "url": url,
+                **({"site": site} if site else {}),
+            }
+        )
+        seen_urls.add(url)
+
+    return sources
+
+
+def _summarize_markdown_for_index(content: str, limit: int = 500) -> str:
+    text = re.sub(r"(?ms)^##\s+来源\s*\n.*$", "", content).strip()
+    text = _wikilinks_to_text(text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _make_note_id(title: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = _safe_markdown_filename(title).removesuffix(".md")
+    return f"{timestamp}_{name}"
+
+
+@tool
+def save_markdown_note(
+    content: str,
+    title: str = "",
+    path: str | None = None,
+) -> dict[str, Any]:
+    """Save a completed Markdown research note under outputs/.
+
+    Pass path only when the user explicitly requested a file name or relative path.
+    """
+
+    cleaned_content = _clean_markdown_content(content)
+    if not cleaned_content:
+        return {"ok": False, "error": "content 不能为空"}
+
+    resolved_title = _normalize_filename_label(title) if title.strip() else _extract_markdown_title(cleaned_content)
+    if not resolved_title:
+        resolved_title = datetime.now().strftime("output_%Y%m%d_%H%M%S")
+
+    try:
+        target_path = _safe_output_path(path, resolved_title)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(cleaned_content, encoding="utf-8")
+
+    return {
+        "ok": True,
+        "title": resolved_title,
+        "path": str(target_path),
+        "filename": target_path.name,
+    }
+
+
+@tool
+def save_note_index(
+    query: str,
+    content: str,
+    path: str,
+    title: str = "",
+) -> dict[str, Any]:
+    """Append a structured note record to outputs/index.jsonl."""
+
+    cleaned_content = _clean_markdown_content(content)
+    if not cleaned_content:
+        return {"ok": False, "error": "content 不能为空"}
+
+    resolved_title = _normalize_filename_label(title) if title.strip() else _extract_markdown_title(cleaned_content)
+    if not resolved_title:
+        resolved_title = Path(path).stem or datetime.now().strftime("output_%Y%m%d_%H%M%S")
+
+    note_path = str(Path(path).resolve())
+    links = _extract_wikilinks(cleaned_content)
+    sources = _extract_sources_from_markdown(cleaned_content)
+    summary = _summarize_markdown_for_index(cleaned_content)
+    note_id = _make_note_id(resolved_title)
+
+    record = {
+        "note_id": note_id,
+        "run_id": "",
+        "title": resolved_title,
+        "query": query,
+        "filename": resolved_title,
+        "path": note_path,
+        "summary": summary,
+        "links": links,
+        "sources": sources,
+        "created_at": datetime.now().astimezone().isoformat(),
+    }
+
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    with INDEX_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return {
+        "ok": True,
+        "note_id": note_id,
+        "title": resolved_title,
+        "path": note_path,
+        "links": links,
+        "sources": sources,
+    }
+
+
+def _is_blocked_shell_command(command: str) -> str | None:
+    normalized = command.strip()
+    for pattern in BASH_TOOL_BLOCKED_PATTERNS:
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            return pattern
+    return None
+
+
+@tool
+async def bash_tool(command: str, timeout_seconds: int = 10) -> dict[str, Any]:
+    """Run a short, non-destructive PowerShell command in the repository root.
+
+    Despite the tool name, this project runs on Windows, so commands are executed through
+    PowerShell. Use it for inspection commands such as Get-ChildItem, Get-Content, git
+    status, python --version, and small verification commands. Destructive commands are
+    blocked.
+    """
+
+    command = command.strip()
+    if not command:
+        return {
+            "ok": False,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "command 不能为空",
+        }
+
+    blocked_pattern = _is_blocked_shell_command(command)
+    if blocked_pattern:
+        return {
+            "ok": False,
+            "returncode": None,
+            "stdout": "",
+            "stderr": f"command 被安全策略拦截：{blocked_pattern}",
+        }
+
+    timeout = max(1, min(int(timeout_seconds), BASH_TOOL_MAX_TIMEOUT_SECONDS))
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+            cwd=WORK_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        stdout_bytes, stderr_bytes = await process.communicate()
+        return {
+            "ok": False,
+            "returncode": None,
+            "stdout": stdout_bytes.decode("utf-8", errors="replace")[:BASH_TOOL_MAX_OUTPUT_CHARS],
+            "stderr": f"command 超过 {timeout} 秒未完成",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": None,
+            "stdout": "",
+            "stderr": str(exc)[:BASH_TOOL_MAX_OUTPUT_CHARS],
+        }
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+    return {
+        "ok": process.returncode == 0,
+        "returncode": process.returncode,
+        "stdout": stdout[:BASH_TOOL_MAX_OUTPUT_CHARS],
+        "stderr": stderr[:BASH_TOOL_MAX_OUTPUT_CHARS],
+    }
+
+
+def _tokenize_index_text(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", text.lower())
+
+
+def _score_index_record(query: str, record: dict[str, Any]) -> float:
+    query_tokens = _tokenize_index_text(query)
+    haystack = " ".join(
+        [
+            str(record.get("title", "")),
+            str(record.get("query", "")),
+            str(record.get("summary", "")),
+            " ".join(record.get("links", []) if isinstance(record.get("links"), list) else []),
+        ]
+    )
+    haystack_tokens = set(_tokenize_index_text(haystack))
+    return float(sum(1 for token in query_tokens if token in haystack_tokens))
+
+
+def _prefilter_index_records(query: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(records) <= LOCAL_NOTE_SELECTOR_CATALOG_LIMIT:
+        return records
+
+    ranked = sorted(
+        records,
+        key=lambda record: (_score_index_record(query, record), str(record.get("created_at", ""))),
+        reverse=True,
+    )
+    return ranked[:LOCAL_NOTE_SELECTOR_CATALOG_LIMIT]
+
+
+def _compact_index_record(record: dict[str, Any], catalog_id: int) -> dict[str, Any]:
+    links = record.get("links", [])
+    if not isinstance(links, list):
+        links = []
+
+    summary = str(record.get("summary", "")).strip()
+    if len(summary) > LOCAL_NOTE_SELECTOR_SUMMARY_CHARS:
+        summary = summary[:LOCAL_NOTE_SELECTOR_SUMMARY_CHARS].rstrip() + "..."
+
+    return {
+        "catalog_id": catalog_id,
+        "title": str(record.get("title", "")).strip(),
+        "summary": summary,
+        "links": links[:8],
+        "path": str(record.get("path", "")).strip(),
+        "note_id": str(record.get("note_id", "")).strip(),
+    }
+
+
+def _build_selection_result(
+    notes: list[dict[str, Any]],
+    reasoning: str,
+    selection_mode: str,
+    ok: bool = True,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "reasoning": reasoning,
+        "selection_mode": selection_mode,
+        "selected_notes": notes,
+        "selected_paths": [item["path"] for item in notes if item.get("path")],
+    }
+
+
+async def _select_candidate_notes_for_query(
+    query: str,
+    candidate_limit: int,
+) -> dict[str, Any]:
+    records = load_index_records()
+    if not records:
+        return _build_selection_result(
+            [],
+            "index.jsonl 不存在或没有可用记录，已跳过目录候选选择",
+            selection_mode="disabled",
+            ok=False,
+        )
+
+    catalog_records = _prefilter_index_records(query, records)
+    catalog = [
+        _compact_index_record(record, catalog_id=index)
+        for index, record in enumerate(catalog_records, start=1)
+    ]
+    fallback_notes = catalog[:candidate_limit]
+
+    try:
+        selector = catalog_selector_llm.with_structured_output(LocalNoteSelection)
+        response = await selector.ainvoke(
+            [
+                SystemMessage(
+                    content=(
+                        "你负责从本地知识库目录中挑选最相关的候选文章，供后续 RAG 检索正文片段。\n"
+                        "给定用户问题和文章目录，每条目录只包含标题、摘要、links 和 path。\n"
+                        "请返回最相关的 catalog_id 列表，最多不要超过用户要求的数量。\n"
+                        "优先选择直接相关、主题明确的文章；不要为了凑数量加入弱相关项。"
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"用户问题：{query}\n\n"
+                        f"最多选择：{candidate_limit} 篇\n\n"
+                        f"文章目录：\n{json.dumps(catalog, ensure_ascii=False, indent=2)}"
+                    )
+                ),
+            ]
+        )
+    except Exception as exc:
+        return _build_selection_result(
+            fallback_notes,
+            (
+                "目录候选选择调用失败，已回退到基于 title/query/summary/links 的词项匹配。"
+                f" 错误：{type(exc).__name__}"
+            ),
+            selection_mode="fallback",
+        )
+
+    selected_ids: list[int] = []
+    for value in response.candidate_ids:
+        if isinstance(value, int) and 1 <= value <= len(catalog):
+            if value not in selected_ids:
+                selected_ids.append(value)
+
+    selected_notes = [item for item in catalog if item["catalog_id"] in selected_ids][:candidate_limit]
+
+    if not selected_notes:
+        return _build_selection_result(
+            fallback_notes,
+            "LLM 没有选出候选文章，已回退到词项匹配后的前几条目录记录",
+            selection_mode="fallback",
+        )
+
+    reasoning = response.reasoning.strip() or "已根据目录摘要挑选候选文章"
+    return _build_selection_result(
+        selected_notes,
+        reasoning,
+        selection_mode="llm",
+    )
+
+
+def _local_rag_search_sync(
+    query: str,
+    top_k: int,
+    min_score: float,
+    allow_same_file: bool,
+    candidate_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    chunks = load_chunks(markdown_paths=candidate_paths) if candidate_paths else load_chunks()
+    if not chunks:
+        return {
+            "ok": False,
+            "query": query,
+            "provider": embedding_provider(),
+            "results": [],
+            "context": "",
+            "error": "outputs/ 下没有可检索的 Markdown 笔记",
+        }
+
+    embeddings = ensure_embeddings(chunks)
+    results = retrieve(
+        query,
+        chunks,
+        embeddings,
+        top_k=max(1, top_k),
+        min_score=max(0.0, min_score),
+        dedupe_by_file=not allow_same_file,
+    )
+    if not results:
+        return {
+            "ok": False,
+            "query": query,
+            "provider": embedding_provider(),
+            "results": [],
+            "context": "",
+            "error": "没有检索到满足条件的本地笔记片段",
+        }
+
+    serialized_results = [
+        {
+            "score": round(score, 6),
+            "title": chunk.title,
+            "section": chunk.section,
+            "path": str(chunk.path),
+            "text": chunk.text,
+        }
+        for score, chunk in results
+    ]
+    return {
+        "ok": True,
+        "query": query,
+        "provider": embedding_provider(),
+        "results": serialized_results,
+        "context": make_context(results),
+    }
+
+
+@tool
+async def local_rag_search(
+    query: str,
+    top_k: int = 3,
+    min_score: float = DEFAULT_RAG_MIN_SCORE,
+    allow_same_file: bool = False,
+    filepath: str | None = None,
+) -> dict[str, Any]:
+    """Search local Markdown notes with embeddings and return retrieved context.
+
+    This tool first uses outputs/index.jsonl summaries to narrow candidate notes, then
+    runs embedding retrieval over candidate note bodies from outputs/*.md. It returns
+    the retrieved chunks plus a preformatted context string that the calling model can
+    use for synthesis.
+    """
+
+    query = query.strip()
+    if not query:
+        return {
+            "ok": False,
+            "query": query,
+            "provider": embedding_provider(),
+            "results": [],
+            "context": "",
+            "error": "query 不能为空",
+        }
+
+    forced_paths = [filepath.strip()] if isinstance(filepath, str) and filepath.strip() else None
+    selection = (
+        {
+            "selected_notes": [],
+            "reasoning": "用户显式指定了 filepath，已跳过目录候选选择",
+            "selection_mode": "filepath",
+            "selected_paths": forced_paths or [],
+        }
+        if forced_paths
+        else await _select_candidate_notes_for_query(query, candidate_limit=max(3, min(8, top_k * 2)))
+    )
+    result = await asyncio.to_thread(
+        _local_rag_search_sync,
+        query,
+        max(1, int(top_k)),
+        float(min_score),
+        bool(allow_same_file),
+        selection.get("selected_paths"),
+    )
+    result["selected_notes"] = selection.get("selected_notes", [])
+    result["selection_reasoning"] = selection.get("reasoning", "")
+    result["selection_mode"] = selection.get("selection_mode", "disabled")
+    result["selection_used"] = bool(selection.get("selected_notes"))
+    if forced_paths:
+        result["filepath"] = forced_paths[0]
+    return result
 
 
 __all__ = [
@@ -701,4 +1351,9 @@ __all__ = [
     "crawl_webpages",
     "fetch_related_urls",
     "search_related_urls",
+    "read_file",
+    "bash_tool",
+    "local_rag_search",
+    "save_markdown_note",
+    "save_note_index",
 ]

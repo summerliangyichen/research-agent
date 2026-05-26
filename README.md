@@ -57,7 +57,7 @@ DAILY_EMAIL_TIMEOUT_SECONDS=300
 ### 3. 验证代码能导入
 
 ```powershell
-python -m py_compile main.py graph.py tool.py daily_email.py outlook_mcp.py schedular.py
+python -m py_compile main.py graph.py tool.py rag.py daily_email.py outlook_mcp.py schedular.py
 ```
 
 ### 4. 初始化 Outlook 登录
@@ -129,6 +129,41 @@ DAILY_EMAIL_CHECK_INTERVAL_SECONDS=30
 ```
 
 如果 `daily_email()` 运行失败，`schedular.py` 会打印错误并继续等待下一轮，不会因为一次失败直接退出。
+
+## 独立 RAG 示例
+
+仓库里有两个独立 RAG 示例，默认不接入 `main.py`、`graph.py`、`daily_email.py` 或 `schedular.py`。
+
+关键词检索示例不需要 embedding 模型：
+
+```powershell
+python rag_example.py "Python 内存管理" --no-llm
+```
+
+embedding 检索示例使用 OpenAI-compatible embeddings API。先在 `.env` 中配置：
+
+```env
+EMBEDDING_PROVIDER=openai_compatible
+EMBEDDING_API_KEY=your_embedding_api_key
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-3-small
+```
+
+如果使用本地 Qwen3 embedding，先用 ModelScope 下载模型到 `models/Qwen3-Embedding-0.6B`，然后配置：
+
+```env
+EMBEDDING_PROVIDER=local_qwen
+LOCAL_EMBEDDING_MODEL=models/Qwen3-Embedding-0.6B
+```
+
+然后运行：
+
+```powershell
+python rag_embedding_example.py --check-config
+python rag_embedding_example.py "对象什么时候会被回收" --no-llm
+```
+
+它会读取 `outputs/*.md`，跳过 `来源`、`仍需确认` 等元信息小节，切分正文片段，生成 embedding，并把向量缓存到 `outputs/.rag_embedding_cache.json`。默认会按文件去重，并过滤低于 `--min-score 0.2` 的结果；如果想看同一文件里的多个片段，可以加 `--allow-same-file`。
 
 ## 输出文件
 

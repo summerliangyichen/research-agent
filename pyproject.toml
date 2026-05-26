@@ -4,4 +4,19 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx",
+    "langchain-core",
+    "langchain-deepseek",
+    "langgraph",
+    "mcp",
+    "modelscope",
+    "msal",
+    "pydantic",
+    "pytest",
+    "python-dotenv",
+    "requests",
+    "sentence-transformers",
+    "tavily-python",
+    "torch",
+]
