@@ -149,7 +149,7 @@ def finish_outlook_login() -> dict[str, Any]:
 
     cache = _load_cache()
     app = _make_app(cache)
-    result = app.acquire_token_by_device_flow(_device_flow)
+    result = app.acquire_token_by_device_flow(_device_flow) 
     _device_flow = None
     _save_cache(cache)
 

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 from langchain_deepseek import ChatDeepSeek
 from typing import TypedDict, Annotated, Any
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage,SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 import re
 from pathlib import Path
 from dotenv import load_dotenv
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel
 from tool import (
     bash_tool,
     batch_crawl_webpage,
@@ -24,10 +24,18 @@ from tool import (
 
 
 WORK_DIR = Path(__file__).parent
+THREADS_PATH = WORK_DIR / "threads.txt"
+
 load_dotenv(WORK_DIR / ".env")
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    user_input: str
+    title: str
+    thread_id_choice: int
+
+class get_title(BaseModel):
+    title_name: str
 
 llm = ChatDeepSeek(
     model="deepseek-v4-flash",
@@ -162,6 +170,52 @@ def _llm_provider_error_message(exc: Exception) -> str:
         return "当前模型提供方余额不足，暂时无法继续调用 LLM。先补余额或切到可用模型，再运行一次。"
     return f"当前模型提供方暂时不可用，无法继续调用 LLM。错误信息：{detail}"
 
+
+async def get_thread_title(state: AgentState) -> dict:
+    title_llm = llm.with_structured_output(get_title)
+    user_input = state["user_input"]
+    result = await title_llm.ainvoke(
+        [
+            SystemMessage(
+                content=(
+                    "你是一个会话标题生成器。"
+                    "请根据当前会话的用户输入，生成一个简短、清楚、适合显示在会话列表中的标题。"
+                    "标题要直接概括主题，不要复述整句问题，不要加解释、前缀、序号、引号、emoji 或 Markdown。"
+                    "长度尽量控制在 4 到 16 个字符；如果是英文术语、书名或专有名词，可以自然放宽，但仍然要简短。"
+                    "如果输入是问候或闲聊，标题用“闲聊”或“问候”这类简短主题词。"
+                    "下面是好的和坏的标题对比："
+                    "用户输入：'python object oriented programming 第五版'；坏标题：'我想问一本 Python 书的内容'；好标题：'Python 面向对象编程'。"
+                    "用户输入：'time.sleep 的参数是秒吗'；坏标题：'time.sleep 的参数是秒吗？详细解释'；好标题：'time.sleep 参数'。"
+                    "用户输入：'你好'；坏标题：'你好呀有什么可以帮你的'；好标题：'问候'。"
+                    "用户输入：'腾讯星火计划'；坏标题：'关于腾讯星火计划的完整研究'；好标题：'腾讯星火计划'。"
+                    "请模仿这些好标题：短、准、直接指向主题。"
+                    "只返回结构化字段 title_name。"
+                )
+            ),
+            HumanMessage(
+                content =(
+                    f"用户原始输入： {user_input}"
+                    "请你生成合适的会话标题"
+                )
+            )
+        ]
+    ) 
+    return {"title":result["title_name"]}
+
+def update_thread_title(state: AgentState):
+    thread_choice = state["thread_id_choice"]
+    title = state['title']
+    with open(THREADS_PATH, "r") as file:
+        threads = file.readlines()
+    current_thread = threads[thread_choice-1].split("-")
+    if not len(current_thread)==3:
+        current_thread.append(title)
+    current_thread = "-".join(current_thread)
+    threads[thread_choice-1] = current_thread
+    with open(THREADS_PATH, "w") as file:
+        for thread in threads:
+            file.write(thread + "\n")
+
 builder = StateGraph(AgentState)
 
 builder.add_node("assistant", assistant_node)
@@ -177,4 +231,8 @@ builder.add_conditional_edges(
 )
 builder.add_edge("tools", "assistant")
 
-graph = builder.compile()
+def compile_graph(*, checkpointer: Any | None = None):
+    return builder.compile(checkpointer=checkpointer)
+
+
+graph = compile_graph()
